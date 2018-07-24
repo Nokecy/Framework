@@ -5,14 +5,15 @@ namespace Volo.Abp.BackgroundJobs
 {
     public class BackgroundJobOptions
     {
-        //TODO: Consider to automatically register jobs
         public Dictionary<string, Type> JobTypes { get; }
 
-        public bool IsJobExecutionEnabled { get; set; }
-        
+        /// <summary>
+        /// Default: true.
+        /// </summary>
+        public bool IsEnabled { get; set; } = true;
+
         public BackgroundJobOptions()
         {
-            IsJobExecutionEnabled = true;
             JobTypes = new Dictionary<string, Type>();
         }
 
