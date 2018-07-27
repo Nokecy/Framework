@@ -1,6 +1,9 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Nito.AsyncEx;
 using RabbitMQ.Client;
@@ -11,16 +14,18 @@ namespace Volo.Abp.BackgroundJobs.RabbitMQ
 {
     public class JobQueue<TArgs> : IJobQueue<TArgs>
     {
-        protected Type JobType { get; }
-        protected string JobName { get; }
-        protected string QueueName { get; }
+        private const string ChannelPrefix = "JobQueue.";
 
+        protected BackgroundJobConfiguration JobConfiguration { get; }
+        protected JobQueueConfiguration QueueConfiguration { get; }
         protected IChannelAccessor ChannelAccessor { get; private set; }
         protected EventingBasicConsumer Consumer { get; private set; }
+        
+        public ILogger<JobQueue<TArgs>> Logger { get; set; }
 
-        protected IChannelPool ChannelPool { get; }
-        protected AbpRabbitMqOptions RabbitMqOptions { get; }
         protected BackgroundJobOptions BackgroundJobOptions { get; }
+        protected RabbitMqBackgroundJobOptions RabbitMqBackgroundJobOptions { get; }
+        protected IChannelPool ChannelPool { get; }
         protected IRabbitMqSerializer Serializer { get; }
         protected IBackgroundJobExecuter JobExecuter { get; }
 
@@ -28,24 +33,37 @@ namespace Volo.Abp.BackgroundJobs.RabbitMQ
         protected bool IsDiposed { get; private set; }
 
         public JobQueue(
+            IOptions<BackgroundJobOptions> backgroundJobOptions,
+            IOptions<RabbitMqBackgroundJobOptions> rabbitMqBackgroundJobOptions,
             IChannelPool channelPool,
             IRabbitMqSerializer serializer,
-            IOptions<AbpRabbitMqOptions> options,
-            IBackgroundJobExecuter jobExecuter,
-            IOptions<BackgroundJobOptions> backgroundJobOptions)
+            IBackgroundJobExecuter jobExecuter)
         {
+            BackgroundJobOptions = backgroundJobOptions.Value;
+            RabbitMqBackgroundJobOptions = rabbitMqBackgroundJobOptions.Value;
             Serializer = serializer;
             JobExecuter = jobExecuter;
-            BackgroundJobOptions = backgroundJobOptions.Value;
             ChannelPool = channelPool;
-            RabbitMqOptions = options.Value;
 
-            JobName = BackgroundJobNameAttribute.GetName<TArgs>();
-            JobType = BackgroundJobOptions.GetJobType(JobName);
-            QueueName = "BackgroundJobs." + JobName; //TODO: Make prefix optional
+            JobConfiguration = BackgroundJobOptions.GetJob(typeof(TArgs));
+            QueueConfiguration = GetOrCreateJobQueueConfiguration();
+
+            Logger = NullLogger<JobQueue<TArgs>>.Instance;
         }
 
-        public virtual async Task<string> Enqueue(TArgs args)
+        protected virtual JobQueueConfiguration GetOrCreateJobQueueConfiguration()
+        {
+            return RabbitMqBackgroundJobOptions.JobQueues.GetOrDefault(typeof(TArgs)) ??
+                   new JobQueueConfiguration(
+                       typeof(TArgs),
+                       RabbitMqBackgroundJobOptions.DefaultQueueNamePrefix + JobConfiguration.JobName
+                   );
+        }
+
+        public virtual async Task<string> EnqueueAsync(
+            TArgs args,
+            BackgroundJobPriority priority = BackgroundJobPriority.Normal,
+            TimeSpan? delay = null)
         {
             CheckDisposed();
 
@@ -53,20 +71,31 @@ namespace Volo.Abp.BackgroundJobs.RabbitMQ
             {
                 await EnsureInitializedAsync();
 
-                await PublishAsync(args);
+                await PublishAsync(args, priority, delay);
 
                 return null;
             }
         }
 
-        public Task StartAsync()
+        public virtual async Task StartAsync(CancellationToken cancellationToken = default)
         {
+            CheckDisposed();
+
             if (!BackgroundJobOptions.IsJobExecutionEnabled)
             {
-                return Task.CompletedTask;
+                return;
             }
 
-            return EnsureInitializedAsync();
+            using (await SyncObj.LockAsync())
+            {
+                await EnsureInitializedAsync();
+            }
+        }
+
+        public virtual Task StopAsync(CancellationToken cancellationToken = default)
+        {
+            Dispose();
+            return Task.CompletedTask;
         }
 
         public virtual void Dispose()
@@ -81,19 +110,20 @@ namespace Volo.Abp.BackgroundJobs.RabbitMQ
             ChannelAccessor?.Dispose();
         }
 
-        public virtual Task EnsureInitializedAsync()
+        protected virtual Task EnsureInitializedAsync()
         {
             if (ChannelAccessor != null)
             {
                 return Task.CompletedTask;
             }
 
-            ChannelAccessor = ChannelPool.Acquire(QueueName);
+            ChannelAccessor = ChannelPool.Acquire(
+                ChannelPrefix + QueueConfiguration.QueueName,
+                QueueConfiguration.ConnectionName
+            );
 
-            var queueOptions = RabbitMqOptions.Queues.GetOrDefault(QueueName)
-                               ?? new QueueOptions(QueueName);
-
-            queueOptions.Declare(ChannelAccessor.Channel);
+            var result = QueueConfiguration.Declare(ChannelAccessor.Channel);
+            Logger.LogDebug($"RabbitMQ Queue '{QueueConfiguration.QueueName}' has {result.MessageCount} messages and {result.ConsumerCount} consumers.");
 
             if (BackgroundJobOptions.IsJobExecutionEnabled)
             {
@@ -102,7 +132,7 @@ namespace Volo.Abp.BackgroundJobs.RabbitMQ
 
                 //TODO: What BasicConsume returns?
                 ChannelAccessor.Channel.BasicConsume(
-                    queue: QueueName,
+                    queue: QueueConfiguration.QueueName,
                     autoAck: false,
                     consumer: Consumer
                 );
@@ -111,11 +141,16 @@ namespace Volo.Abp.BackgroundJobs.RabbitMQ
             return Task.CompletedTask;
         }
 
-        protected virtual Task PublishAsync(TArgs args)
+        protected virtual Task PublishAsync(
+            TArgs args, 
+            BackgroundJobPriority priority = BackgroundJobPriority.Normal,
+            TimeSpan? delay = null)
         {
+            //TODO: How to handle priority & delay?
+
             ChannelAccessor.Channel.BasicPublish(
                 exchange: "",
-                routingKey: QueueName,
+                routingKey: QueueConfiguration.QueueName,
                 basicProperties: CreateBasicPropertiesToPublish(),
                 body: Serializer.Serialize(args)
             );
@@ -133,16 +168,28 @@ namespace Volo.Abp.BackgroundJobs.RabbitMQ
         protected virtual void MessageReceived(object sender, BasicDeliverEventArgs ea)
         {
             var context = new JobExecutionContext(
-                JobType,
+                JobConfiguration.JobType,
                 Serializer.Deserialize(ea.Body, typeof(TArgs))
             );
 
-            JobExecuter.Execute(context);
-
-            //TODO: How to ACK on success or Reject on failure?
+            try
+            {
+                JobExecuter.Execute(context);
+                ChannelAccessor.Channel.BasicAck(deliveryTag: ea.DeliveryTag, multiple: false);
+            }
+            catch (BackgroundJobExecutionException)
+            {
+                //TODO: Reject like that?
+                ChannelAccessor.Channel.BasicReject(deliveryTag: ea.DeliveryTag, requeue: true);
+            }
+            catch (Exception)
+            {
+                //TODO: Reject like that?
+                ChannelAccessor.Channel.BasicReject(deliveryTag: ea.DeliveryTag, requeue: false);
+            }
         }
 
-        private void CheckDisposed()
+        protected void CheckDisposed()
         {
             if (IsDiposed)
             {

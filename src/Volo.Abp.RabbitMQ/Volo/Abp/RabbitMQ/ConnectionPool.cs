@@ -1,5 +1,4 @@
-﻿using System;
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Collections.Generic;
 using Microsoft.Extensions.Options;
 using RabbitMQ.Client;
@@ -7,7 +6,7 @@ using Volo.Abp.DependencyInjection;
 
 namespace Volo.Abp.RabbitMQ
 {
-    public class ConnectionPool : IConnectionPool, IDisposable, ISingletonDependency
+    public class ConnectionPool : IConnectionPool, ISingletonDependency
     {
         protected AbpRabbitMqOptions Options { get; }
 
@@ -23,13 +22,16 @@ namespace Volo.Abp.RabbitMQ
 
         public virtual IConnection Get(string connectionName = null)
         {
-            return Connections.GetOrAdd(connectionName, () =>
-            {
-                var connectionFactory = Options.Connections.GetOrDefault(connectionName)
-                                        ?? Options.Connections.Default;
+            connectionName = connectionName
+                             ?? RabbitMqConnections.DefaultConnectionName;
 
-                return connectionFactory.CreateConnection();
-            });
+            return Connections.GetOrAdd(
+                connectionName,
+                () => Options
+                    .ConnectionFactories
+                    .GetOrDefault(connectionName)
+                    .CreateConnection()
+            );
         }
 
         public void Dispose()
@@ -52,6 +54,8 @@ namespace Volo.Abp.RabbitMQ
 
                 }
             }
+
+            Connections.Clear();
         }
     }
 }

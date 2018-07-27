@@ -1,20 +1,16 @@
 ﻿using System;
 using System.Threading.Tasks;
-using RabbitMQ.Client;
 using Volo.Abp.DependencyInjection;
-using Volo.Abp.RabbitMQ;
 
 namespace Volo.Abp.BackgroundJobs.RabbitMQ
 {
     public class RabbitMqBackgroundJobManager : IBackgroundJobManager, ITransientDependency
     {
-        protected IChannelPool ChannelPool { get; }
-        protected IRabbitMqSerializer Serializer { get; }
+        private readonly IJobQueueManager _jobQueueManager;
 
-        public RabbitMqBackgroundJobManager(IChannelPool channelPool, IRabbitMqSerializer serializer)
+        public RabbitMqBackgroundJobManager(IJobQueueManager jobQueueManager)
         {
-            Serializer = serializer;
-            ChannelPool = channelPool;
+            _jobQueueManager = jobQueueManager;
         }
 
         public Task<string> EnqueueAsync<TArgs>(
@@ -22,7 +18,9 @@ namespace Volo.Abp.BackgroundJobs.RabbitMQ
             BackgroundJobPriority priority = BackgroundJobPriority.Normal,
             TimeSpan? delay = null)
         {
-            
+            return _jobQueueManager
+                .Get<TArgs>()
+                .EnqueueAsync(args, priority, delay);
         }
     }
 }
